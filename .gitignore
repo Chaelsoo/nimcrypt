@@ -1,0 +1,14 @@
+# Compiled binaries
+*.exe
+*.dll
+*.bin
+*.a
+
+# Output dirs
+bins/
+lib/
+output/
+
+# Debug artifacts
+loader_debug.nim
+debug.txt
