@@ -200,3 +200,5 @@ Paste the output into the PS session before downloading or executing anything. T
 
 - https://github.com/gatariee/ldrgen
 - https://github.com/D3Ext/Hooka
+
+You can find more details about Defender Mechanisms, Techniques & Other tools on [my blog](https://chaelsoo.me)
